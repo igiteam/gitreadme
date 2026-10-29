@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitHub README Reader</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown.min.css"/>
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    background: #fff;
+    color: #111;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0d1117; color: #e6edf3; }
+    #bar { background: #161b22; border-color: #30363d; }
+    #bar input { background: #0d1117; color: #e6edf3; border-color: #30363d; }
+    #bar button { background: #21262d; color: #e6edf3; border-color: #30363d; }
+    #bar button:hover { background: #30363d; }
+    #bar button.on { background: #238636; border-color: #2ea043; color: #fff; }
+    #status { color: #8b949e; }
+  }
+  #bar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: #f5f5f5;
+    border-bottom: 1px solid #ddd;
+    padding: 6px 8px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+  }
+  #bar button {
+    font: inherit;
+    padding: 3px 10px;
+    border: 1px solid #bbb;
+    background: #fff;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  #bar button:hover { background: #eee; }
+  #bar button.on { background: #1a7f37; border-color: #1a7f37; color: #fff; }
+  #bar input {
+    font: inherit;
+    flex: 1;
+    min-width: 120px;
+    padding: 3px 6px;
+    border: 1px solid #bbb;
+    border-radius: 3px;
+  }
+  #status { padding: 6px 8px; color: #666; font-size: 12px; }
+  #status:empty { display: none; }
+
+  #readme-wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 24px 32px 64px;
+  }
+  #readme { min-height: 100px; }
+  #readme:empty { display: none; }
+
+  #error {
+    display: none;
+    max-width: 980px;
+    margin: 24px auto;
+    padding: 12px 16px;
+    background: #ffebe9;
+    border: 1px solid #ff818266;
+    border-radius: 6px;
+    color: #cf222e;
+    white-space: pre-wrap;
+    font-family: ui-monospace, monospace;
+    font-size: 13px;
+  }
+  #error.show { display: block; }
+  @media (prefers-color-scheme: dark) {
+    #error { background: #3d1d1d; border-color: #f85149; color: #ffa198; }
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+
+<div id="bar">
+  <input id="url" type="text"
+         placeholder="https://github.com/owner/repo  ·  …/blob/main/README.md  ·  owner/repo" />
+  <button id="load">Load</button>
+  <button id="engine" title="Toggle renderer: local marked.js (default, no limit) vs GitHub API (exact, 60/hr, 4KB body limit)">
+    Renderer: local
+  </button>
+</div>
+<div id="status"></div>
+<div id="error"></div>
+<div id="readme-wrap">
+  <article id="readme" class="markdown-body"></article>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const GITHUB_API   = "https://api.github.com";
+  const RAW_BASE     = "https://raw.githubusercontent.com/";
+  const GITHUB_BLOB  = "https://github.com/";
+  const MARKDOWN_API = "https://api.github.com/markdown/raw";
+  const PROXY        = "https://api.codetabs.com/v1/proxy/?quest=";
+
+  const urlEl    = document.getElementById("url");
+  const loadBtn  = document.getElementById("load");
+  const engineBtn = document.getElementById("engine");
+  const statusEl = document.getElementById("status");
+  const errorEl  = document.getElementById("error");
+  const readmeEl = document.getElementById("readme");
+
+  let engine = "local";   // "local" | "github"
+  let lastTarget = null;  // for re-render on engine toggle
+  let lastMarkdown = null;
+
+  function setStatus(m) { statusEl.textContent = m || ""; }
+  function showError(m) {
+    errorEl.textContent = "⚠ " + m;
+    errorEl.classList.add("show");
+  }
+  function clearError() {
+    errorEl.textContent = "";
+    errorEl.classList.remove("show");
+  }
+
+  // ---------- marked config (GitHub-flavored) ----------
+  marked.setOptions({
+    gfm: true,
+    breaks: false,
+    headerIds: true,
+    mangle: false,
+  });
+
+  // ---------- Parse input ----------
+  function parseInput(input) {
+    input = (input || "").trim();
+    if (!input) return null;
+
+    if (!/^https?:/i.test(input) && !input.includes("raw.githubusercontent.com")) {
+      const m = input.match(/^([^\/\s]+)\/([^\/\s#?]+)/);
+      if (m) return { kind: "repo", owner: m[1], repo: m[2].replace(/\.git$/, "") };
+      return null;
+    }
+
+    let u;
+    try { u = new URL(input); } catch (e) { return null; }
+
+    if (/^raw\.githubusercontent\.com$/i.test(u.hostname)) {
+      const parts = u.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+      if (parts.length < 4) return null;
+      return {
+        kind: "raw",
+        owner: parts[0], repo: parts[1], branch: parts[2],
+        path: parts.slice(3).join("/"),
+      };
+    }
+
+    if (!/^github\.com$/i.test(u.hostname)) return null;
+    const parts = u.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    if (parts.length < 2) return null;
+
+    const owner = parts[0];
+    const repo  = parts[1].replace(/\.git$/, "");
+
+    if (parts.length === 2) return { kind: "repo", owner, repo };
+    if (parts[2] === "blob" && parts.length >= 5) {
+      return { kind: "file", owner, repo, branch: parts[3], path: parts.slice(4).join("/") };
+    }
+    return { kind: "repo", owner, repo };
+  }
+
+  // ---------- Fetch helpers ----------
+  async function fetchText(url) {
+    const attempts = [
+      () => fetch(url, { cache: "no-store" }),
+      () => fetch(PROXY + encodeURIComponent(url), { cache: "no-store" }),
+    ];
+    let lastErr;
+    for (const attempt of attempts) {
+      try {
+        const res = await attempt();
+        if (!res.ok) throw new Error("HTTP " + res.status + " " + res.statusText + " for " + url);
+        return await res.text();
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr;
+  }
+
+  async function ghJson(url) {
+    const res = await fetch(url, { headers: { Accept: "application/vnd.github+json" } });
+    if (res.status === 404) throw new Error("Not found: " + url);
+    if (res.status === 403) throw new Error("GitHub API rate limit hit. Wait an hour or use a token.");
+    if (!res.ok) throw new Error("GitHub API " + res.status + " " + res.statusText);
+    return res.json();
+  }
+
+  // ---------- Resolve repo -> README ----------
+  async function resolveReadme(owner, repo) {
+    try {
+      const info = await ghJson(GITHUB_API + "/repos/" + owner + "/" + repo + "/readme");
+      if (info && info.download_url) {
+        const m = info.download_url.match(/raw\.githubusercontent\.com\/[^/]+\/[^/]+\/([^/]+)\//);
+        return {
+          owner, repo,
+          branch: m ? m[1] : "HEAD",
+          path: info.path,
+          url: info.download_url,
+          htmlUrl: info.html_url,
+        };
+      }
+    } catch (e) { /* fall through */ }
+
+    const repoInfo = await ghJson(GITHUB_API + "/repos/" + owner + "/" + repo);
+    const branch = repoInfo.default_branch || "main";
+    const candidates = ["README.md", "readme.md", "Readme.md", "README.markdown", "README"];
+    for (const name of candidates) {
+      const url = RAW_BASE + owner + "/" + repo + "/" + branch + "/" + name;
+      try {
+        const res = await fetch(url, { method: "HEAD", cache: "no-store" });
+        if (res.ok) {
+          return {
+            owner, repo, branch, path: name, url,
+            htmlUrl: GITHUB_BLOB + owner + "/" + repo + "/blob/" + branch + "/" + name,
+          };
+        }
+      } catch (e) { /* keep probing */ }
+    }
+    throw new Error("No README found in " + owner + "/" + repo + " on branch " + branch);
+  }
+
+  // ---------- Fix relative URLs in HTML ----------
+  function absolutize(html, ctx) {
+    const container = document.createElement("div");
+    container.innerHTML = html;
+
+    const repoDir = ctx.path.includes("/")
+      ? ctx.path.slice(0, ctx.path.lastIndexOf("/") + 1)
+      : "";
+    const rawBase  = RAW_BASE    + ctx.owner + "/" + ctx.repo + "/" + ctx.branch + "/" + repoDir;
+    const blobBase = GITHUB_BLOB + ctx.owner + "/" + ctx.repo + "/blob/" + ctx.branch + "/" + repoDir;
+
+    // Relative image src / video poster / source src → raw.githubusercontent.com
+    container.querySelectorAll("img[src], source[src], video[poster]").forEach(function (el) {
+      const attr = el.hasAttribute("src") ? "src" : "poster";
+      const v = el.getAttribute(attr);
+      if (!v) return;
+      if (/^(https?:|data:|mailto:|#)/i.test(v)) return;
+      try { el.setAttribute(attr, new URL(v, rawBase).href); } catch (e) {}
+    });
+
+    // Relative <a href> → github.com blob URL
+    container.querySelectorAll("a[href]").forEach(function (a) {
+      const v = a.getAttribute("href");
+      if (!v) return;
+      if (/^(https?:|mailto:|#)/i.test(v)) return;
+      try {
+        a.setAttribute("href", new URL(v, blobBase).href);
+        a.setAttribute("target", "_blank");
+        a.setAttribute("rel", "noopener noreferrer");
+      } catch (e) {}
+    });
+
+    return container.innerHTML;
+  }
+
+  // ---------- Render: LOCAL (marked.js) — no size limit ----------
+  function renderLocal(markdown, ctx) {
+    const rawHtml = marked.parse(markdown);
+    const fixed   = absolutize(rawHtml, ctx);
+    // Default DOMPurify profile — keeps <img>, <details>, <summary>, <table>, style attrs, etc.
+    return window.DOMPurify ? DOMPurify.sanitize(fixed) : fixed;
+  }
+
+  // ---------- Render: GITHUB API — chunked to bypass 4KB body limit ----------
+  async function renderGithub(markdown) {
+    // The raw endpoint caps request body around ~4096 bytes and returns an
+    // empty/truncated body past that without erroring. Split on blank lines.
+    const chunks = [];
+    let current = "";
+    const MAX = 3500;
+    for (const block of markdown.split(/\n{2,}/)) {
+      const piece = block + "\n\n";
+      if (current.length + piece.length > MAX && current) {
+        chunks.push(current);
+        current = piece;
+      } else {
+        current += piece;
+      }
+    }
+    if (current.trim()) chunks.push(current);
+    if (!chunks.length) chunks.push(markdown);
+
+    let out = "";
+    for (const chunk of chunks) {
+      const res = await fetch(MARKDOWN_API, {
+        method: "POST",
+        headers: { "Content-Type": "text/x-markdown" },
+        body: chunk,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(
+          "GitHub Markdown API HTTP " + res.status +
+          " (rate limit 60/hr)." + (body ? " " + body : "")
+        );
+      }
+      out += await res.text();
+    }
+    return out;
+  }
+
+  // ---------- Render dispatcher ----------
+  async function render(markdown, ctx) {
+    if (engine === "github") {
+      const html = await renderGithub(markdown);
+      const fixed = absolutize(html, ctx);
+      return window.DOMPurify ? DOMPurify.sanitize(fixed) : fixed;
+    }
+    return renderLocal(markdown, ctx);
+  }
+
+  // ---------- Main ----------
+  async function run(input) {
+    const parsed = parseInput(input);
+    if (!parsed) {
+      showError("Couldn't parse that. Try https://github.com/owner/repo or owner/repo.");
+      return;
+    }
+
+    clearError();
+    readmeEl.innerHTML = "";
+    lastTarget = null;
+    lastMarkdown = null;
+    setStatus("Resolving…");
+
+    try {
+      let target;
+      if (parsed.kind === "repo") {
+        target = await resolveReadme(parsed.owner, parsed.repo);
+      } else {
+        const rawPath = parsed.path.split("/").map(encodeURIComponent).join("/");
+        target = {
+          owner: parsed.owner,
+          repo: parsed.repo,
+          branch: parsed.branch,
+          path: parsed.path,
+          url: RAW_BASE + parsed.owner + "/" + parsed.repo + "/" + parsed.branch + "/" + rawPath,
+          htmlUrl: GITHUB_BLOB + parsed.owner + "/" + parsed.repo + "/blob/" + parsed.branch + "/" + rawPath,
+        };
+      }
+
+      lastTarget = target;
+      urlEl.value = target.htmlUrl;
+
+      setStatus("Fetching markdown… (" + (engine === "github" ? "GitHub API" : "local") + ")");
+      const md = await fetchText(target.url);
+      lastMarkdown = md;
+
+      setStatus("Rendering " + md.length.toLocaleString() + " bytes…");
+      const html = await render(md, target);
+
+      setStatus("");
+      readmeEl.innerHTML = html;
+
+      try {
+        history.replaceState(null, "", "?url=" + encodeURIComponent(target.htmlUrl));
+      } catch (e) { /* file:// */ }
+    } catch (err) {
+      console.error(err);
+      setStatus("");
+      readmeEl.innerHTML = "";
+      showError(err.message || String(err));
+    }
+  }
+
+  // ---------- Wiring ----------
+  loadBtn.addEventListener("click", function () { run(urlEl.value); });
+  urlEl.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") run(urlEl.value);
+  });
+
+  engineBtn.addEventListener("click", async function () {
+    engine = (engine === "local") ? "github" : "local";
+    engineBtn.textContent = "Renderer: " + engine;
+    engineBtn.classList.toggle("on", engine === "github");
+
+    // Re-render current markdown without re-fetching
+    if (lastMarkdown && lastTarget) {
+      clearError();
+      setStatus("Re-rendering (" + engine + ")…");
+      try {
+        const html = await render(lastMarkdown, lastTarget);
+        readmeEl.innerHTML = html;
+        setStatus("");
+      } catch (err) {
+        setStatus("");
+        readmeEl.innerHTML = "";
+        showError(err.message || String(err));
+      }
+    }
+  });
+
+  const params = new URLSearchParams(location.search);
+  const initial = params.get("url");
+  if (initial) {
+    urlEl.value = initial;
+    run(initial);
+  }
+})();
+</script>
+</body>
+</html>
